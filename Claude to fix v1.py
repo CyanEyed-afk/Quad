@@ -62,6 +62,10 @@ FPS = 60
 GEN_TIME = 25
 POP_SIZE = 20
 FF_MULTIPLIER = 8
+SUBSTEPS = 4
+MAX_VELOCITY = 2000         # px/sec linear velocity cap
+MAX_ANGULAR_VELOCITY = 20   # rad/sec angular velocity cap
+CURRENT_GEN = 1             # updated each generation in main()
 
 CAT_GROUND = 0x1
 CAT_WALKER = 0x2
@@ -336,6 +340,30 @@ def tag_creatures_by_niche(population):
 
 
 # ---------------------------------------------------------------------------
+# CURRICULUM
+# ---------------------------------------------------------------------------
+
+def curriculum_weights(gen):
+    """Returns per-component fitness multipliers keyed by stage."""
+    if gen <= 50:       # STAND
+        return {"distance": 0.0, "alt": 0.0, "lifted": 0.0, "upright": 5.0, "penalties": 1.0}
+    elif gen <= 150:    # BALANCE
+        return {"distance": 0.0, "alt": 0.5, "lifted": 1.0, "upright": 2.0, "penalties": 1.0}
+    else:               # WALK
+        return {"distance": 1.0, "alt": 1.0, "lifted": 1.0, "upright": 1.0, "penalties": 1.0}
+
+
+def curriculum_stage(gen):
+    """Returns (stage_name, colour) for HUD display."""
+    if gen <= 50:
+        return "STAND",   (255, 140,   0)   # orange
+    elif gen <= 150:
+        return "BALANCE", (255, 255,   0)   # yellow
+    else:
+        return "WALK",    (  0, 255,   0)   # green
+
+
+# ---------------------------------------------------------------------------
 # QUADRUPED
 # ---------------------------------------------------------------------------
 
@@ -588,9 +616,25 @@ class Quadruped:
 
         outputs = self.nn.predict(buf)
         self.last_motor_out = outputs
-        for i in range(min(len(self.motors), 10)):
-            self.motors[i].rate = float(outputs[i]) * 5.0
-            self.total_energy_used += abs(self.motors[i].rate) * FIT_ENERGY_PENALTY
+
+        # Soft-start: first 30 frames let the body settle; brain still runs
+        if self._frame_count >= 30:
+            motor_damp = min(1.0, 0.4 + 0.6 * (CURRENT_GEN / 30))
+            for i in range(min(len(self.motors), 10)):
+                self.motors[i].rate = float(outputs[i]) * 5.0 * motor_damp
+                self.total_energy_used += abs(self.motors[i].rate) * FIT_ENERGY_PENALTY
+        else:
+            for i in range(min(len(self.motors), 10)):
+                self.motors[i].rate = 0.0
+
+        # Velocity clamping — preserves direction, only reduces magnitude
+        for body in self.bodies:
+            speed = body.velocity.length
+            if speed > MAX_VELOCITY:
+                body.velocity = body.velocity * (MAX_VELOCITY / speed)
+            if abs(body.angular_velocity) > MAX_ANGULAR_VELOCITY:
+                body.angular_velocity = math.copysign(MAX_ANGULAR_VELOCITY,
+                                                      body.angular_velocity)
 
         # --- FITNESS TRACKING ---
         any_foot_down = any(foot_contacts_now)
@@ -643,17 +687,18 @@ class Quadruped:
         if forward_motion and time_since_touchdown > 30:
             self.slide_frames += 1
 
-        # --- COMPOSITE FITNESS (with feet gate) ---
+        # --- COMPOSITE FITNESS (with feet gate + curriculum weights) ---
+        cw = curriculum_weights(CURRENT_GEN)
         dist = max(0.0, torso.position.x - 600)
         feet_factor = min(1.0, self.foot_touchdown_events / TARGET_TOUCHDOWNS)
-        distance_score = dist * FIT_DISTANCE_GAIN * feet_factor
-        alt_score      = self.foot_touchdown_events * FIT_ALTERNATING_GAIN
-        lifted_score   = self.lifted_foot_frames * FIT_LIFTED_FOOT_GAIN
-        upright_score  = self.upright_frames * FIT_UPRIGHT_GAIN
-        torso_pen      = self.torso_drag_frames * FIT_TORSO_DRAG_PENALTY
-        head_pen       = self.head_drag_frames * FIT_HEAD_DRAG_PENALTY
-        tilt_pen       = self.total_tilt * FIT_TILT_PENALTY
-        slide_pen      = self.slide_frames * FIT_SLIDE_PENALTY
+        distance_score = dist * FIT_DISTANCE_GAIN * feet_factor          * cw["distance"]
+        alt_score      = self.foot_touchdown_events * FIT_ALTERNATING_GAIN * cw["alt"]
+        lifted_score   = self.lifted_foot_frames * FIT_LIFTED_FOOT_GAIN    * cw["lifted"]
+        upright_score  = self.upright_frames * FIT_UPRIGHT_GAIN            * cw["upright"]
+        torso_pen      = self.torso_drag_frames * FIT_TORSO_DRAG_PENALTY   * cw["penalties"]
+        head_pen       = self.head_drag_frames * FIT_HEAD_DRAG_PENALTY     * cw["penalties"]
+        tilt_pen       = self.total_tilt * FIT_TILT_PENALTY                * cw["penalties"]
+        slide_pen      = self.slide_frames * FIT_SLIDE_PENALTY             * cw["penalties"]
 
         self.cached_fitness = max(0.0,
             distance_score + alt_score + lifted_score + upright_score
@@ -1058,7 +1103,11 @@ def main():
     history = History()
     state = STATE_SIM
 
-    floor = pymunk.Segment(space.static_body, (-1e5, floor_y), (1e6, floor_y), 40)
+    # Thick floor: 100 px solid box so fast bodies cannot tunnel through.
+    # Top surface sits exactly at floor_y; visual fill already covers floor_y→bottom.
+    floor_verts = [(-100000, floor_y), (1000000, floor_y),
+                   (1000000, floor_y + 100), (-100000, floor_y + 100)]
+    floor = pymunk.Poly(space.static_body, floor_verts)
     floor.friction = 2.0
     floor.filter = pymunk.ShapeFilter(categories=CAT_GROUND)
     space.add(floor)
@@ -1070,7 +1119,9 @@ def main():
     else:
         population = [Quadruped(space, spawn_genome(midpoint)) for _ in range(POP_SIZE)]
 
+    global CURRENT_GEN
     gen, timer, cam_x, ff = 1, 0, 0, False
+    CURRENT_GEN = gen
     flash_msg, flash_timer = "", 0
 
     font = pygame.font.SysFont("monospace", 42, bold=True)
@@ -1126,7 +1177,8 @@ def main():
             timer += dt
             for q in population:
                 q.update(timer, floor_y)
-            space.step(dt)
+            for _ in range(SUBSTEPS):
+                space.step(dt / SUBSTEPS)
 
         leader = max(population, key=lambda x: x.cached_fitness)
         history.log_brain(leader.last_motor_out)
@@ -1157,8 +1209,11 @@ def main():
                     joint_col = JOINT_DOT
                 q.draw(screen, cam_x, body_col, joint_col, leader=(q == leader))
 
-            screen.blit(font.render(f"GEN: {gen}  FIT: {int(leader.cached_fitness)}", True, WHITE),
-                        (50, 50))
+            stage_name, stage_col = curriculum_stage(gen)
+            gen_surf = font.render(f"GEN: {gen}  FIT: {int(leader.cached_fitness)}", True, WHITE)
+            stage_surf = font.render(f"[{stage_name}]", True, stage_col)
+            screen.blit(gen_surf, (50, 50))
+            screen.blit(stage_surf, (50 + gen_surf.get_width() + 18, 50))
 
             # Niche HUD — shows best score in each niche this generation
             for idx, niche in enumerate(NICHES):
@@ -1222,6 +1277,7 @@ def main():
             population = [Quadruped(space, g) for g in new_genomes]
             tag_creatures_by_niche(population)
             gen += 1
+            CURRENT_GEN = gen
             timer = 0
 
         pygame.display.flip()
