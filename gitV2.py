@@ -287,6 +287,29 @@ def assign_niches(population):
     return niche_rankings
 
 
+def live_niche_score(q, niche):
+    """Current-state score used only for LEADERS rendering.
+    Uses instantaneous physical state, not accumulated history."""
+    if niche == "distance":
+        return q.bodies[0].position.x
+    elif niche == "footwork":
+        return q.foot_touchdown_events
+    elif niche == "stability":
+        return -(q.bodies[0].position.y)  # lowest Y = highest off ground = most upright
+    elif niche == "efficiency":
+        return q.cached_fitness / max(1.0, q.total_energy_used)
+    return 0.0
+
+
+def assign_live_leaders(alive_pop):
+    """Returns dict niche -> single leader creature by current physical state.
+    Used only for LEADERS display — does not affect evolution."""
+    if not alive_pop:
+        return {}
+    return {niche: max(alive_pop, key=lambda q: live_niche_score(q, niche))
+            for niche in NICHES}
+
+
 def build_next_generation_niche(population):
     """
     Build the next generation with niche-based speciation.
@@ -1121,8 +1144,8 @@ def main():
     midpoint = load_midpoint_body()
     space.gravity = (0, midpoint.get("gravity", 2000))
     space.damping = 0.9
-    space.collision_slop = 0.0
-    space.collision_bias = pow(1.0 - 0.3, 60)
+    space.collision_slop = 0.5
+    space.collision_bias = pow(1.0 - 0.1, 60)
     floor_y = HEIGHT - 150
     history = History()
     state = STATE_SIM
@@ -1247,14 +1270,12 @@ def main():
 
             if show_leaders_only:
                 alive_pop = [q for q in population if not q.is_dead]
-                niche_rankings = assign_niches(alive_pop) if alive_pop else {}
+                niche_leaders = assign_live_leaders(alive_pop)
                 leader_niche_map = {}
-                for niche, ranked in niche_rankings.items():
-                    if ranked:
-                        lq = ranked[0]
-                        if lq not in leader_niche_map:
-                            leader_niche_map[lq] = []
-                        leader_niche_map[lq].append(niche)
+                for niche, lq in niche_leaders.items():
+                    if lq not in leader_niche_map:
+                        leader_niche_map[lq] = []
+                    leader_niche_map[lq].append(niche)
                 for q in draw_order_cache:
                     if q.is_dead or q not in leader_niche_map:
                         continue
