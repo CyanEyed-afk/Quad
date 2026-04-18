@@ -57,14 +57,15 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 pygame.init()
+pygame.event.set_allowed([pygame.QUIT, pygame.MOUSEBUTTONDOWN, pygame.KEYDOWN])
 WIDTH, HEIGHT = 2400, 1080
 FPS = 60
 GEN_TIME = 25
 POP_SIZE = 30
 FF_MULTIPLIER = 8
-SUBSTEPS = 4
-MAX_VELOCITY = 1000         # px/sec linear velocity cap
-MAX_ANGULAR_VELOCITY = 20   # rad/sec angular velocity cap
+SUBSTEPS = 6
+MAX_LIN_VEL = 800
+MAX_ANG_VEL = 10
 CURRENT_GEN = 1             # updated each generation in main()
 
 CAT_GROUND = 0x1
@@ -103,6 +104,8 @@ NICHE_SLOTS = {
 }
 # Total must equal POP_SIZE
 assert sum(NICHE_SLOTS.values()) == POP_SIZE
+
+NICHE_ABBREV = {"distance": "DIST", "footwork": "FOOT", "stability": "STAB", "efficiency": "EFF"}
 
 STATE_SIM      = 0
 STATE_STATS    = 1
@@ -421,14 +424,18 @@ class Quadruped:
 
         m_rear = pymunk.Body(rear_m, pymunk.moment_for_box(rear_m, (rear_len, rear_h)))
         m_rear.position = (sx, sy)
+        m_rear.sleep_time_threshold = float('inf')
         s_rear = pymunk.Poly.create_box(m_rear, (rear_len, rear_h))
+        s_rear._is_circle = False
         s_rear.filter = wf
         s_rear.friction = 0.1
         self.torso_shapes.append(s_rear)
 
         m_front = pymunk.Body(front_m, pymunk.moment_for_box(front_m, (front_len, front_h)))
         m_front.position = (sx + rear_len / 2 + front_len / 2, sy)
+        m_front.sleep_time_threshold = float('inf')
         s_front = pymunk.Poly.create_box(m_front, (front_len, front_h))
+        s_front._is_circle = False
         s_front.filter = wf
         s_front.friction = 0.1
         self.torso_shapes.append(s_front)
@@ -440,7 +447,7 @@ class Quadruped:
                                           stiffness=p("spine_stiffness"),
                                           damping=p("spine_damping"))
         sp_m = pymunk.SimpleMotor(m_rear, m_front, 0)
-        sp_m.max_force = p("spine_motor_force")
+        sp_m.max_force = min(p("spine_motor_force"), 2e5)
         self.space.add(m_rear, s_rear, m_front, s_front, sp_p, sp_l, sp_s, sp_m)
         self.bodies.extend([m_rear, m_front])
         self.shapes.extend([s_rear, s_front])
@@ -457,7 +464,9 @@ class Quadruped:
         self.head_body = pymunk.Body(p("head_mass"),
                                      pymunk.moment_for_circle(p("head_mass"), 0, head_r))
         self.head_body.position = head_pos
+        self.head_body.sleep_time_threshold = float('inf')
         self.head_shape = pymunk.Circle(self.head_body, head_r)
+        self.head_shape._is_circle = True
         self.head_shape.filter = wf
         self.head_shape.friction = 0.1
         neck_p = pymunk.PivotJoint(m_front, self.head_body,
@@ -468,6 +477,7 @@ class Quadruped:
         neck_s = pymunk.DampedRotarySpring(m_front, self.head_body, rest_angle=0.0,
                                             stiffness=2000, damping=200)
         neck_m = pymunk.SimpleMotor(m_front, self.head_body, 0)
+        neck_m.max_force = 1e5
         self.space.add(self.head_body, self.head_shape, neck_p, neck_l, neck_s, neck_m)
         self.bodies.append(self.head_body)
         self.shapes.append(self.head_shape)
@@ -488,7 +498,9 @@ class Quadruped:
             seg_pos = (sx - rear_len / 2 - seg_w / 2 - i * seg_w, sy - rear_h / 4)
             seg_body = pymunk.Body(tail_mass, pymunk.moment_for_box(tail_mass, (seg_w, seg_h)))
             seg_body.position = seg_pos
+            seg_body.sleep_time_threshold = float('inf')
             seg_shape = pymunk.Poly.create_box(seg_body, (seg_w, seg_h))
+            seg_shape._is_circle = False
             seg_shape.filter = wf
             seg_shape.friction = 0.1
             anchor_prev = attach_local if i == 0 else (-seg_w / 2, 0)
@@ -526,7 +538,9 @@ class Quadruped:
             upper_pos = (hip_world[0], hip_world[1] + upper_len / 2)
             u_body = pymunk.Body(upper_m, pymunk.moment_for_box(upper_m, (14, upper_len)))
             u_body.position = upper_pos
+            u_body.sleep_time_threshold = float('inf')
             u_shape = pymunk.Poly.create_box(u_body, (14, upper_len))
+            u_shape._is_circle = False
             u_shape.filter = wf
             u_shape.friction = 0.1
             self.upper_leg_shapes.append(u_shape)
@@ -535,7 +549,9 @@ class Quadruped:
             lower_pos = (knee_world[0], knee_world[1] + lower_len / 2)
             l_body = pymunk.Body(lower_m, pymunk.moment_for_box(lower_m, (10, lower_len)))
             l_body.position = lower_pos
+            l_body.sleep_time_threshold = float('inf')
             l_shape = pymunk.Poly.create_box(l_body, (10, lower_len))
+            l_shape._is_circle = False
             l_shape.filter = wf
             l_shape.friction = 0.1
 
@@ -543,19 +559,21 @@ class Quadruped:
             foot_pos = (ankle_world[0] + foot_len / 3, ankle_world[1])
             f_body = pymunk.Body(foot_m, pymunk.moment_for_box(foot_m, (foot_len, 10)))
             f_body.position = foot_pos
+            f_body.sleep_time_threshold = float('inf')
             f_shape = pymunk.Poly.create_box(f_body, (foot_len, 10))
+            f_shape._is_circle = False
             f_shape.filter = wf
             f_shape.friction = foot_fric
 
             hip_p = pymunk.PivotJoint(parent, u_body, hip_world)
             hip_l = pymunk.RotaryLimitJoint(parent, u_body, -hip_back, hip_fwd)
             hip_m = pymunk.SimpleMotor(parent, u_body, 0)
-            hip_m.max_force = 5e5
+            hip_m.max_force = 3e5
 
             knee_p = pymunk.PivotJoint(u_body, l_body, knee_world)
             knee_l = pymunk.RotaryLimitJoint(u_body, l_body, -0.1, knee_lim)
             knee_m = pymunk.SimpleMotor(u_body, l_body, 0)
-            knee_m.max_force = 4e5
+            knee_m.max_force = 2e5
 
             ankle_p = pymunk.PivotJoint(l_body, f_body, ankle_world)
             ankle_l = pymunk.RotaryLimitJoint(l_body, f_body, -0.4, 0.4)
@@ -582,6 +600,12 @@ class Quadruped:
             _lb, _ll = l_body, lower_len
             self.joint_positions.append(("ankle",
                 lambda pb=_lb, u=_ll: pb.position + pymunk.Vec2d(0, u / 2).rotated(pb.angle)))
+
+    def _kill(self):
+        self.is_dead = True
+        for m in self.motors:
+            m.rate = 0.0
+        self.nn.h_state = np.zeros(self.nn.hidden_size)
 
     def _check_ground_contact(self, shape, ground_y, margin=5):
         return shape.bb.bottom >= ground_y - margin
@@ -619,9 +643,8 @@ class Quadruped:
 
         # Soft-start: first 30 frames let the body settle; brain still runs
         if self._frame_count >= 30:
-            motor_damp = min(1.0, 0.4 + 0.6 * (CURRENT_GEN / 30))
             for i in range(min(len(self.motors), 10)):
-                self.motors[i].rate = float(outputs[i]) * 5.0 * motor_damp
+                self.motors[i].rate = float(np.clip(outputs[i], -1.0, 1.0)) * 3.0
                 self.total_energy_used += abs(self.motors[i].rate) * FIT_ENERGY_PENALTY
         else:
             for i in range(min(len(self.motors), 10)):
@@ -629,12 +652,10 @@ class Quadruped:
 
         # Velocity clamping — preserves direction, only reduces magnitude
         for body in self.bodies:
-            speed = body.velocity.length
-            if speed > MAX_VELOCITY:
-                body.velocity = body.velocity * (MAX_VELOCITY / speed)
-            if abs(body.angular_velocity) > MAX_ANGULAR_VELOCITY:
-                body.angular_velocity = math.copysign(MAX_ANGULAR_VELOCITY,
-                                                      body.angular_velocity)
+            if body.velocity.length > MAX_LIN_VEL:
+                body.velocity = body.velocity.normalized() * MAX_LIN_VEL
+            if abs(body.angular_velocity) > MAX_ANG_VEL:
+                body.angular_velocity = math.copysign(MAX_ANG_VEL, body.angular_velocity)
 
         # --- FITNESS TRACKING ---
         any_foot_down = any(foot_contacts_now)
@@ -707,10 +728,10 @@ class Quadruped:
 
         if abs(torso.position.x - self.last_x) > 400:
             self.is_glitched = True
-            self.is_dead = True
+            self._kill()
         self.last_x = torso.position.x
         if self.head_drag_frames > 30:
-            self.is_dead = True
+            self._kill()
 
     def fitness_components(self):
         dist = max(0.0, self.bodies[0].position.x - 600)
@@ -730,11 +751,11 @@ class Quadruped:
 
     def draw(self, sc, cam_x, body_col, joint_col, leader=False):
         for b, s in zip(self.bodies, self.shapes):
-            if isinstance(s, pymunk.Circle):
+            if s._is_circle:
                 pos = (int(b.position.x - cam_x), int(b.position.y))
                 pygame.draw.circle(sc, body_col, pos, int(s.radius))
                 pygame.draw.circle(sc, HEAD_COLOR, pos, int(s.radius), 3)
-            elif isinstance(s, pymunk.Poly):
+            else:
                 verts = [v.rotated(b.angle) + b.position - (cam_x, 0) for v in s.get_vertices()]
                 pygame.draw.polygon(sc, body_col, verts)
                 pygame.draw.polygon(sc, (0, 0, 0), verts, 2)
@@ -1099,18 +1120,21 @@ def main():
 
     midpoint = load_midpoint_body()
     space.gravity = (0, midpoint.get("gravity", 2000))
+    space.damping = 0.9
+    space.collision_slop = 0.0
+    space.collision_bias = pow(1.0 - 0.3, 60)
     floor_y = HEIGHT - 150
     history = History()
     state = STATE_SIM
 
-    # Thick floor: 100 px solid box so fast bodies cannot tunnel through.
-    # Top surface sits exactly at floor_y; visual fill already covers floor_y→bottom.
-    floor_verts = [(-100000, floor_y), (1000000, floor_y),
-                   (1000000, floor_y + 100), (-100000, floor_y + 100)]
-    floor = pymunk.Poly(space.static_body, floor_verts)
+    # Solid static floor box — top face at floor_y, 200 px deep, spans full sim range.
+    floor_body = pymunk.Body(body_type=pymunk.Body.STATIC)
+    floor_verts = [(-5000, floor_y), (15000, floor_y),
+                   (15000, floor_y + 200), (-5000, floor_y + 200)]
+    floor = pymunk.Poly(floor_body, floor_verts)
     floor.friction = 2.0
     floor.filter = pymunk.ShapeFilter(categories=CAT_GROUND)
-    space.add(floor)
+    space.add(floor_body, floor)
 
     seed_genome = load_winner_genome(midpoint)
     if seed_genome is not None:
@@ -1140,6 +1164,25 @@ def main():
     body_btn     = mk_btn(4)
     ff_btn       = mk_btn(5)
     save_btn     = mk_btn(6)
+    leaders_btn  = mk_btn(7)
+
+    show_leaders_only = False
+
+    # Pre-render static button label surfaces
+    _lbl_brain   = small_font.render("BRAIN",    True, WHITE)
+    _lbl_gait    = small_font.render("GAIT",     True, WHITE)
+    _lbl_fitness = small_font.render("FITNESS",  True, WHITE)
+    _lbl_body    = small_font.render("BODY",     True, WHITE)
+    _lbl_save    = small_font.render("SAVE WIN", True, WHITE)
+    _lbl_stats   = small_font.render("STATS",    True, WHITE)
+    _lbl_back    = small_font.render("BACK",     True, WHITE)
+    _lbl_ff      = small_font.render("FAST FWD", True, WHITE)
+    _lbl_normal  = small_font.render("NORMAL",   True, WHITE)
+    _lbl_leaders = small_font.render("LEADERS",  True, WHITE)
+
+    # Sort-order cache for draw loop
+    draw_order_cache = []
+    draw_order_dead_count = -1
 
     # Do an initial niche tagging so colours appear from generation 1
     tag_creatures_by_niche(population)
@@ -1164,6 +1207,8 @@ def main():
                     state = STATE_BODY if state != STATE_BODY else STATE_SIM
                 elif ff_btn.collidepoint(event.pos):
                     ff = not ff
+                elif leaders_btn.collidepoint(event.pos):
+                    show_leaders_only = not show_leaders_only
                 elif save_btn.collidepoint(event.pos):
                     leader = max(population, key=lambda x: x.cached_fitness)
                     if save_winner(leader):
@@ -1176,7 +1221,8 @@ def main():
         for _ in range(steps):
             timer += dt
             for q in population:
-                q.update(timer, floor_y)
+                if not q.is_dead:
+                    q.update(timer, floor_y)
             for _ in range(SUBSTEPS):
                 space.step(dt / SUBSTEPS)
 
@@ -1193,21 +1239,52 @@ def main():
                 tag = small_font.render(str(mx), True, (60, 60, 70))
                 screen.blit(tag, (sx + 5, floor_y - 30))
 
-            for q in sorted(population, key=lambda x: x.is_dead, reverse=True):
-                niche = getattr(q, "niche_tag", "distance") or "distance"
-                base_col = NICHE_COLORS[niche]
-                if q.is_glitched:
-                    body_col, joint_col = (255, 0, 255), WHITE
-                elif q.is_dead:
-                    body_col = tuple(int(c * 0.35) for c in base_col)
-                    joint_col = (60, 60, 60)
-                elif q == leader:
-                    body_col = base_col
-                    joint_col = JOINT_LEADER
-                else:
-                    body_col = tuple(int(c * 0.75) for c in base_col)
-                    joint_col = JOINT_DOT
-                q.draw(screen, cam_x, body_col, joint_col, leader=(q == leader))
+            # Rebuild sort cache only when death count changes
+            current_dead = sum(1 for q in population if q.is_dead)
+            if current_dead != draw_order_dead_count or len(draw_order_cache) != len(population):
+                draw_order_cache[:] = sorted(population, key=lambda x: x.is_dead, reverse=True)
+                draw_order_dead_count = current_dead
+
+            if show_leaders_only:
+                alive_pop = [q for q in population if not q.is_dead]
+                niche_rankings = assign_niches(alive_pop) if alive_pop else {}
+                leader_niche_map = {}
+                for niche, ranked in niche_rankings.items():
+                    if ranked:
+                        lq = ranked[0]
+                        if lq not in leader_niche_map:
+                            leader_niche_map[lq] = []
+                        leader_niche_map[lq].append(niche)
+                for q in draw_order_cache:
+                    if q.is_dead or q not in leader_niche_map:
+                        continue
+                    niche = getattr(q, "niche_tag", "distance") or "distance"
+                    base_col = NICHE_COLORS[niche]
+                    body_col = base_col if q == leader else tuple(int(c * 0.75) for c in base_col)
+                    joint_col = JOINT_LEADER if q == leader else JOINT_DOT
+                    q.draw(screen, cam_x, body_col, joint_col, leader=(q == leader))
+                    torso_pos = q.bodies[0].position
+                    lbl_x = int(torso_pos.x - cam_x)
+                    lbl_y = int(torso_pos.y) - 70
+                    for ni, niche_name in enumerate(leader_niche_map[q]):
+                        abbrev_surf = tiny_font.render(NICHE_ABBREV[niche_name], True,
+                                                       NICHE_COLORS[niche_name])
+                        screen.blit(abbrev_surf, (lbl_x + ni * 55, lbl_y))
+            else:
+                for q in draw_order_cache:
+                    if q.is_dead:
+                        continue
+                    niche = getattr(q, "niche_tag", "distance") or "distance"
+                    base_col = NICHE_COLORS[niche]
+                    if q.is_glitched:
+                        body_col, joint_col = (255, 0, 255), WHITE
+                    elif q == leader:
+                        body_col = base_col
+                        joint_col = JOINT_LEADER
+                    else:
+                        body_col = tuple(int(c * 0.75) for c in base_col)
+                        joint_col = JOINT_DOT
+                    q.draw(screen, cam_x, body_col, joint_col, leader=(q == leader))
 
             stage_name, stage_col = curriculum_stage(gen)
             gen_surf = font.render(f"GEN: {gen}  FIT: {int(leader.cached_fitness)}", True, WHITE)
@@ -1247,18 +1324,18 @@ def main():
         elif state == STATE_BODY:
             history.draw_body_evolution(screen, font, small_font)
 
-        button_labels = [
-            (nav_btn, "BACK" if state != STATE_SIM else "STATS", BTN_BG),
-            (brain_btn, "BRAIN", BTN_BG),
-            (gait_btn, "GAIT", BTN_BG),
-            (fitness_btn, "FITNESS", BTN_BG),
-            (body_btn, "BODY", BTN_BG),
-            (ff_btn, "NORMAL" if ff else "FAST FWD", BTN_HI if ff else BTN_BG),
-            (save_btn, "SAVE WIN", (50, 80, 50)),
+        button_entries = [
+            (nav_btn,     _lbl_back    if state != STATE_SIM else _lbl_stats, BTN_BG),
+            (brain_btn,   _lbl_brain,   BTN_BG),
+            (gait_btn,    _lbl_gait,    BTN_BG),
+            (fitness_btn, _lbl_fitness, BTN_BG),
+            (body_btn,    _lbl_body,    BTN_BG),
+            (ff_btn,      _lbl_normal  if ff else _lbl_ff,   BTN_HI if ff else BTN_BG),
+            (save_btn,    _lbl_save,    (50, 80, 50)),
+            (leaders_btn, _lbl_leaders, (40, 80, 40) if show_leaders_only else BTN_BG),
         ]
-        for rect, label, col in button_labels:
+        for rect, lbl, col in button_entries:
             pygame.draw.rect(screen, col, rect, border_radius=10)
-            lbl = small_font.render(label, True, WHITE)
             screen.blit(lbl, (rect.centerx - lbl.get_width() // 2,
                               rect.centery - lbl.get_height() // 2))
 
@@ -1279,6 +1356,8 @@ def main():
             gen += 1
             CURRENT_GEN = gen
             timer = 0
+            draw_order_cache.clear()
+            draw_order_dead_count = -1
 
         pygame.display.flip()
         clock.tick(FPS)
